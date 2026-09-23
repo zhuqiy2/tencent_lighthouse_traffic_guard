@@ -71,6 +71,14 @@ CAM 用户的最小权限如下，策略模板见 [cam-policy-minimal.json](cam-
 
 `--instance-id` 和 `TENCENTCLOUD_INSTANCE_ID` 都支持逗号分隔多个实例。程序会逐台查询；达到阈值时只关机对应实例，重复 ID 会自动去重。
 
+多个地域使用 `TENCENTCLOUD_TARGETS`，格式为 `地域=实例 ID[,实例 ID];地域=实例 ID`：
+
+```dotenv
+TENCENTCLOUD_TARGETS=ap-seoul=lhins-seoul-1,lhins-seoul-2;ap-guangzhou=lhins-gz-1
+```
+
+设置 `TENCENTCLOUD_TARGETS` 后，它会优先于 `TENCENTCLOUD_REGION` 和 `TENCENTCLOUD_INSTANCE_ID`。每个地域使用独立 API 客户端。
+
 确认行为后开启真实关机：
 
 ```bash

@@ -14,6 +14,31 @@ func TestSplitInstanceIDs(t *testing.T) {
 	}
 }
 
+func TestParseTargets(t *testing.T) {
+	got, err := parseTargets("ap-seoul=lh-seoul-1,lh-seoul-2;ap-guangzhou=lh-gz-1", "ap-beijing", "ignored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []targetGroup{
+		{Region: "ap-seoul", InstanceIDs: []string{"lh-seoul-1", "lh-seoul-2"}},
+		{Region: "ap-guangzhou", InstanceIDs: []string{"lh-gz-1"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseTargets() = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseTargetsFallsBackToLegacyVariables(t *testing.T) {
+	got, err := parseTargets("", "ap-seoul", "lh-1,lh-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []targetGroup{{Region: "ap-seoul", InstanceIDs: []string{"lh-1", "lh-2"}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseTargets() = %#v, want %#v", got, want)
+	}
+}
+
 type fakeAPI struct {
 	usage Usage
 	stop  bool

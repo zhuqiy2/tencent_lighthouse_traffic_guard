@@ -38,6 +38,11 @@ type SDKClient struct {
 	client *lighthouse.Client
 }
 
+type targetGroup struct {
+	Region      string
+	InstanceIDs []string
+}
+
 func (c *SDKClient) DescribeInstances(ctx context.Context, instanceID string) (Usage, error) {
 	req := lighthouse.NewDescribeInstancesRequest()
 	if instanceID != "" {
@@ -126,8 +131,11 @@ func main() {
 	execute := flag.Bool("execute", false, "actually stop the instance when threshold is exceeded")
 	flag.Parse()
 
-	ids := splitInstanceIDs(*instanceIDs)
-	if len(ids) == 0 {
+	targets, err := parseTargets(os.Getenv("TENCENTCLOUD_TARGETS"), *region, *instanceIDs)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if len(targets) == 0 {
 		log.Fatal("missing -instance-id or TENCENTCLOUD_INSTANCE_ID")
 	}
 	if *threshold <= 0 || *threshold > 100 {
@@ -142,19 +150,22 @@ func main() {
 	cred := common.NewCredential(secretID, secretKey)
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Endpoint = "lighthouse.tencentcloudapi.com"
-	client, err := lighthouse.NewClient(cred, *region, cpf)
-	if err != nil {
-		log.Fatal(err)
-	}
-	api := &SDKClient{client: client}
-
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var failed bool
-		for _, instanceID := range ids {
-			if err := evaluate(ctx, api, instanceID, *threshold, *execute); err != nil {
-				log.Print(err)
+		for _, target := range targets {
+			client, err := lighthouse.NewClient(cred, target.Region, cpf)
+			if err != nil {
+				log.Printf("region=%s create client: %v", target.Region, err)
 				failed = true
+				continue
+			}
+			api := &SDKClient{client: client}
+			for _, instanceID := range target.InstanceIDs {
+				if err := evaluate(ctx, api, instanceID, *threshold, *execute); err != nil {
+					log.Print(err)
+					failed = true
+				}
 			}
 		}
 		cancel()
@@ -166,6 +177,35 @@ func main() {
 		}
 		time.Sleep(*interval)
 	}
+}
+
+func parseTargets(value, fallbackRegion, fallbackIDs string) ([]targetGroup, error) {
+	if strings.TrimSpace(value) == "" {
+		ids := splitInstanceIDs(fallbackIDs)
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		return []targetGroup{{Region: fallbackRegion, InstanceIDs: ids}}, nil
+	}
+	var targets []targetGroup
+	seenRegions := make(map[string]struct{})
+	for _, item := range strings.Split(value, ";") {
+		region, idsValue, found := strings.Cut(item, "=")
+		region = strings.TrimSpace(region)
+		if !found || region == "" {
+			return nil, fmt.Errorf("invalid target %q, expected region=instance-id[,instance-id]", item)
+		}
+		if _, exists := seenRegions[region]; exists {
+			return nil, fmt.Errorf("duplicate region %q in TENCENTCLOUD_TARGETS", region)
+		}
+		ids := splitInstanceIDs(idsValue)
+		if len(ids) == 0 {
+			return nil, fmt.Errorf("region %q has no instance IDs", region)
+		}
+		seenRegions[region] = struct{}{}
+		targets = append(targets, targetGroup{Region: region, InstanceIDs: ids})
+	}
+	return targets, nil
 }
 
 func splitInstanceIDs(value string) []string {
