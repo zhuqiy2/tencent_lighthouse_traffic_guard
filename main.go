@@ -22,6 +22,10 @@ type Usage struct {
 	State      string
 }
 
+type usageState struct {
+	UsedBytes int64 `json:"usedBytes"`
+}
+
 func (u Usage) Percent() float64 {
 	if u.TotalBytes <= 0 {
 		return 0
@@ -32,6 +36,7 @@ func (u Usage) Percent() float64 {
 type LighthouseAPI interface {
 	DescribeInstances(ctx context.Context, instanceID string) (Usage, error)
 	StopInstance(ctx context.Context, instanceID string) error
+	StartInstance(ctx context.Context, instanceID string) error
 }
 
 type SDKClient struct {
@@ -91,13 +96,29 @@ func (c *SDKClient) StopInstance(ctx context.Context, instanceID string) error {
 	return err
 }
 
-func evaluate(ctx context.Context, api LighthouseAPI, instanceID string, threshold float64, execute bool) error {
+func (c *SDKClient) StartInstance(ctx context.Context, instanceID string) error {
+	req := lighthouse.NewStartInstancesRequest()
+	req.InstanceIds = []*string{&instanceID}
+	_, err := c.client.StartInstancesWithContext(ctx, req)
+	return err
+}
+
+func evaluate(ctx context.Context, api LighthouseAPI, instanceID string, threshold float64, execute, autoStart bool) error {
 	usage, err := api.DescribeInstances(ctx, instanceID)
 	if err != nil {
 		return fmt.Errorf("query traffic usage: %w", err)
 	}
 	percent := usage.Percent()
 	log.Printf("instance=%s state=%s used=%d total=%d usage=%.2f%% threshold=%.2f%%", usage.InstanceID, usage.State, usage.UsedBytes, usage.TotalBytes, percent, threshold)
+	if autoStart && percent < threshold && (strings.EqualFold(usage.State, "SHUTDOWN") || strings.EqualFold(usage.State, "STOPPED")) {
+		if !execute {
+			log.Printf("traffic appears reset; dry run, add --execute to start the instance")
+		} else if err := api.StartInstance(ctx, usage.InstanceID); err != nil {
+			return fmt.Errorf("start instance: %w", err)
+		} else {
+			log.Printf("start request submitted for instance=%s", usage.InstanceID)
+		}
+	}
 	if percent < threshold {
 		return nil
 	}
@@ -129,6 +150,7 @@ func main() {
 	threshold := flag.Float64("threshold", envFloat("TRAFFIC_THRESHOLD_PERCENT", 95), "shutdown threshold in percent")
 	interval := flag.Duration("interval", 0, "repeat interval; 0 means run once")
 	execute := flag.Bool("execute", false, "actually stop the instance when threshold is exceeded")
+	autoStart := flag.Bool("auto-start", false, "start stopped instances when usage is below the threshold")
 	flag.Parse()
 
 	targets, err := parseTargets(os.Getenv("TENCENTCLOUD_TARGETS"), *region, *instanceIDs)
@@ -162,7 +184,7 @@ func main() {
 			}
 			api := &SDKClient{client: client}
 			for _, instanceID := range target.InstanceIDs {
-				if err := evaluate(ctx, api, instanceID, *threshold, *execute); err != nil {
+				if err := evaluate(ctx, api, instanceID, *threshold, *execute, *autoStart); err != nil {
 					log.Print(err)
 					failed = true
 				}

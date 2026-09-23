@@ -42,6 +42,7 @@ func TestParseTargetsFallsBackToLegacyVariables(t *testing.T) {
 type fakeAPI struct {
 	usage Usage
 	stop  bool
+	start bool
 }
 
 func (f *fakeAPI) DescribeInstances(context.Context, string) (Usage, error) {
@@ -53,9 +54,14 @@ func (f *fakeAPI) StopInstance(context.Context, string) error {
 	return nil
 }
 
+func (f *fakeAPI) StartInstance(context.Context, string) error {
+	f.start = true
+	return nil
+}
+
 func TestEvaluateDryRunDoesNotStop(t *testing.T) {
 	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 96, TotalBytes: 100, State: "RUNNING"}}
-	if err := evaluate(context.Background(), api, "lh-1", 95, false); err != nil {
+	if err := evaluate(context.Background(), api, "lh-1", 95, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if api.stop {
@@ -65,7 +71,7 @@ func TestEvaluateDryRunDoesNotStop(t *testing.T) {
 
 func TestEvaluateStopsWhenEnabled(t *testing.T) {
 	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 95, TotalBytes: 100, State: "RUNNING"}}
-	if err := evaluate(context.Background(), api, "lh-1", 95, true); err != nil {
+	if err := evaluate(context.Background(), api, "lh-1", 95, true, false); err != nil {
 		t.Fatal(err)
 	}
 	if !api.stop {
@@ -75,10 +81,20 @@ func TestEvaluateStopsWhenEnabled(t *testing.T) {
 
 func TestEvaluateDoesNotStopBelowThreshold(t *testing.T) {
 	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 94, TotalBytes: 100, State: "RUNNING"}}
-	if err := evaluate(context.Background(), api, "lh-1", 95, true); err != nil {
+	if err := evaluate(context.Background(), api, "lh-1", 95, true, false); err != nil {
 		t.Fatal(err)
 	}
 	if api.stop {
 		t.Fatal("usage below threshold stopped the instance")
+	}
+}
+
+func TestEvaluateAutoStartsStoppedInstanceBelowThreshold(t *testing.T) {
+	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 10, TotalBytes: 100, State: "STOPPED"}}
+	if err := evaluate(context.Background(), api, "lh-1", 95, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if !api.start {
+		t.Fatal("stopped instance was not started")
 	}
 }
