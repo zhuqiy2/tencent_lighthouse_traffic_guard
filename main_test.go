@@ -97,6 +97,36 @@ func TestParseTargetsRejectsAllRegionsWithExplicitIDs(t *testing.T) {
 	if _, err := parseTargets("*=lh-1", "", ""); err == nil {
 		t.Fatal("expected all-regions with explicit IDs to be rejected")
 	}
+	if _, err := parseTargets("all=lh-1", "", ""); err == nil {
+		t.Fatal("expected all-regions with explicit IDs to be rejected")
+	}
+}
+
+func TestParseTargetsAllRegionsSpelledAll(t *testing.T) {
+	got, err := parseTargets("", "all", "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []targetGroup{{Region: "*", AutoDiscover: true, AllRegions: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseTargets() = %#v, want %#v", got, want)
+	}
+
+	got, err = parseTargets("all=all", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseTargets() = %#v, want %#v", got, want)
+	}
+
+	got, err = parseTargets("ALL=ALL", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseTargets() = %#v, want %#v", got, want)
+	}
 }
 
 func TestMergeRegionTargetsKeepsExplicitAndDeduplicates(t *testing.T) {

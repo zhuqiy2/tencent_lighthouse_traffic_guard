@@ -102,7 +102,7 @@ TENCENTCLOUD_INSTANCE_ID=all
 
 ### 自动覆盖全部地域
 
-用 `*` 作为地域，可自动枚举所有可用的 Lighthouse 地域，并在每个地域内自动发现实例：
+用 `*`（或 `all`）作为地域，可自动枚举所有可用的 Lighthouse 地域，并在每个地域内自动发现实例：
 
 ```dotenv
 TENCENTCLOUD_TARGETS=*=all
@@ -115,7 +115,14 @@ TENCENTCLOUD_REGION=*
 TENCENTCLOUD_INSTANCE_ID=all
 ```
 
-`*` 只能搭配 `all`。如果同时显式配置了某个地域，该地域不会被重复处理。全地域模式会产生较多 API 调用，请先用 dry-run 确认范围与耗时。
+或直接：
+
+```dotenv
+TENCENTCLOUD_REGION=all
+TENCENTCLOUD_INSTANCE_ID=all
+```
+
+`*` / `all` 只能搭配 `all`。如果同时显式配置了某个地域，该地域不会被重复处理。全地域模式会产生较多 API 调用，请先用 dry-run 确认范围与耗时。
 
 确认行为后开启真实关机：
 

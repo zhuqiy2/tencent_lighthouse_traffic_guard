@@ -303,9 +303,9 @@ func buildTarget(region string, ids []string) (targetGroup, error) {
 	if len(ids) == 0 {
 		return targetGroup{}, fmt.Errorf("region %q has no instance IDs", region)
 	}
-	if region == "*" {
+	if isAllRegions(region) {
 		if !(len(ids) == 1 && strings.EqualFold(ids[0], "all")) {
-			return targetGroup{}, fmt.Errorf("\"*\" only supports all instances, use *=all")
+			return targetGroup{}, fmt.Errorf("%q means all regions and only supports all instances, use %s=all or *=all", region, region)
 		}
 		return targetGroup{Region: "*", AutoDiscover: true, AllRegions: true}, nil
 	}
@@ -327,7 +327,7 @@ func expandAllRegions(ctx context.Context, cred common.CredentialIface, cpf *pro
 			expanded = append(expanded, target)
 			continue
 		}
-		if bootstrapRegion == "" || bootstrapRegion == "*" {
+		if bootstrapRegion == "" || isAllRegions(bootstrapRegion) {
 			bootstrapRegion = "ap-guangzhou"
 		}
 		client, err := lighthouse.NewClient(cred, bootstrapRegion, cpf)
@@ -341,6 +341,12 @@ func expandAllRegions(ctx context.Context, cred common.CredentialIface, cpf *pro
 		expanded = mergeRegionTargets(expanded, regions)
 	}
 	return expanded, nil
+}
+
+// isAllRegions reports whether region means "every available region".
+// Both "*" and "all" are accepted so that TENCENTCLOUD_REGION=all works.
+func isAllRegions(region string) bool {
+	return region == "*" || strings.EqualFold(region, "all")
 }
 
 func mergeRegionTargets(existing []targetGroup, regions []string) []targetGroup {
