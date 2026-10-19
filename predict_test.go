@@ -39,13 +39,10 @@ func TestPredictRateAndProjection(t *testing.T) {
 
 	now := start.Add(4 * time.Hour)
 	store.observe("lh-1", 200, 1000, now)
-	got := store.predict("lh-1", now, 75*time.Minute)
+	got := store.predict("lh-1", now)
 
 	if got.RatePerHour != 100 {
 		t.Fatalf("rate = %v, want 100", got.RatePerHour)
-	}
-	if !got.Stale {
-		t.Fatal("data should be stale after 2h without changes")
 	}
 	if got.Used != 400 {
 		t.Fatalf("predicted used = %d, want 400", got.Used)
@@ -55,19 +52,43 @@ func TestPredictRateAndProjection(t *testing.T) {
 	}
 }
 
-func TestPredictIsConservativeWhenFresh(t *testing.T) {
+func TestPredictGrowsWithinRefreshInterval(t *testing.T) {
 	store := newStateStore("")
 	start := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
 	store.observe("lh-1", 0, 1000, start)
 	store.observe("lh-1", 100, 1000, start.Add(time.Hour))
 
+	// Thirty minutes after the last refresh the API still reports 100, but the
+	// instance has been consuming traffic the whole time.
+	now := start.Add(time.Hour + 30*time.Minute)
+	store.observe("lh-1", 100, 1000, now)
+
+	got := store.predict("lh-1", now)
+	if got.RatePerHour != 100 {
+		t.Fatalf("rate = %v, want 100", got.RatePerHour)
+	}
+	if got.Elapsed != 30*time.Minute {
+		t.Fatalf("elapsed = %v, want 30m", got.Elapsed)
+	}
+	if got.Used != 150 {
+		t.Fatalf("predicted used = %d, want 150", got.Used)
+	}
+}
+
+func TestPredictEqualsActualRightAfterRefresh(t *testing.T) {
+	store := newStateStore("")
+	start := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	store.observe("lh-1", 0, 1000, start)
+
 	now := start.Add(time.Hour)
-	got := store.predict("lh-1", now, 75*time.Minute)
-	if got.Stale {
-		t.Fatal("fresh data must not be treated as stale")
+	store.observe("lh-1", 100, 1000, now)
+
+	got := store.predict("lh-1", now)
+	if got.Elapsed != 0 {
+		t.Fatalf("elapsed = %v, want 0 right after a refresh", got.Elapsed)
 	}
 	if got.Used != 100 {
-		t.Fatalf("predicted used = %d, want 100 without stale data", got.Used)
+		t.Fatalf("predicted used = %d, want 100", got.Used)
 	}
 }
 
@@ -88,7 +109,7 @@ func TestPredictAveragesSevenDays(t *testing.T) {
 	if oldest := stat.Points[0]; oldest.At.Before(now.Add(-historyWindow - time.Hour)) {
 		t.Fatalf("oldest point = %v, history exceeds the retention period", oldest.At)
 	}
-	got := store.predict("lh-1", now, 75*time.Minute)
+	got := store.predict("lh-1", now)
 	if got.RatePerHour != 10 {
 		t.Fatalf("rate = %v, want an average of 10 bytes per hour", got.RatePerHour)
 	}
@@ -123,6 +144,36 @@ func TestObserveResetsOnPackageSizeChange(t *testing.T) {
 	}
 }
 
+func TestEvaluateDoesNotExtrapolateStoppedInstance(t *testing.T) {
+	store := newStateStore("")
+	start := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	store.observe("lh-1", 0, 1000, start)
+	store.observe("lh-1", 100, 1000, start.Add(time.Hour))
+
+	// A stopped instance keeps reporting 100 bytes, but it is not consuming
+	// anything, so the history must not be projected forward.
+	now := start.Add(time.Hour + 2*time.Hour)
+	store.observe("lh-1", 100, 1000, now)
+
+	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 100, TotalBytes: 1000, State: "STOPPED"}}
+	opts := evaluateOptions{
+		Threshold: 15,
+		Execute:   true,
+		AutoStart: true,
+		Store:     store,
+		Now:       now,
+	}
+	if err := evaluate(context.Background(), api, "lh-1", opts); err != nil {
+		t.Fatal(err)
+	}
+	if !api.start {
+		t.Fatal("stopped instance below the threshold should be started")
+	}
+	if api.stop {
+		t.Fatal("stopped instance must not receive another stop request")
+	}
+}
+
 func TestStateRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	store := newStateStore(path)
@@ -148,50 +199,53 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 }
 
-func TestEvaluateStopsOnStalePrediction(t *testing.T) {
+func TestEvaluateStopsOnPredictedUsage(t *testing.T) {
 	store := newStateStore("")
 	start := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
 	store.observe("lh-1", 0, 1000, start)
 	store.observe("lh-1", 100, 1000, start.Add(time.Hour))
-	store.observe("lh-1", 200, 1000, start.Add(2*time.Hour))
-	now := start.Add(4 * time.Hour)
-	store.observe("lh-1", 200, 1000, now)
 
-	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 200, TotalBytes: 1000, State: "RUNNING"}}
+	// Only 100 bytes are reported, but 30 minutes of traffic at 100B/h have not
+	// been reported yet, so the predicted usage reaches 150 bytes (15%).
+	now := start.Add(time.Hour + 30*time.Minute)
+	store.observe("lh-1", 100, 1000, now)
+
+	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 100, TotalBytes: 1000, State: "RUNNING"}}
 	opts := evaluateOptions{
-		Threshold:  30,
-		Execute:    true,
-		Store:      store,
-		StaleAfter: 75 * time.Minute,
-		Now:        now,
+		Threshold: 15,
+		Execute:   true,
+		Store:     store,
+		Now:       now,
 	}
 	if err := evaluate(context.Background(), api, "lh-1", opts); err != nil {
 		t.Fatal(err)
 	}
 	if !api.stop {
-		t.Fatal("stale data with predicted usage above the threshold should stop the instance")
+		t.Fatal("predicted usage above the threshold should stop the instance")
 	}
 }
 
-func TestEvaluateIgnoresPredictionWhenFresh(t *testing.T) {
+func TestEvaluateDoesNotStopWhenPredictionIsBelowThreshold(t *testing.T) {
 	store := newStateStore("")
 	start := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
 	store.observe("lh-1", 0, 1000, start)
-	now := start.Add(2 * time.Hour)
-	store.observe("lh-1", 200, 1000, now)
+	store.observe("lh-1", 100, 1000, start.Add(time.Hour))
 
-	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 200, TotalBytes: 1000, State: "RUNNING"}}
+	// Reported usage is 10%, predicted usage 15%, threshold 20%.
+	now := start.Add(time.Hour + 30*time.Minute)
+	store.observe("lh-1", 100, 1000, now)
+
+	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 100, TotalBytes: 1000, State: "RUNNING"}}
 	opts := evaluateOptions{
-		Threshold:  30,
-		Execute:    true,
-		Store:      store,
-		StaleAfter: 75 * time.Minute,
-		Now:        now,
+		Threshold: 20,
+		Execute:   true,
+		Store:     store,
+		Now:       now,
 	}
 	if err := evaluate(context.Background(), api, "lh-1", opts); err != nil {
 		t.Fatal(err)
 	}
 	if api.stop {
-		t.Fatal("fresh data must not trigger prediction-based shutdown")
+		t.Fatal("predicted usage below the threshold must not stop the instance")
 	}
 }

@@ -57,8 +57,7 @@ type prediction struct {
 	Used        int64
 	Percent     float64
 	RatePerHour float64
-	StaleFor    time.Duration
-	Stale       bool
+	Elapsed     time.Duration
 	Points      int
 }
 
@@ -166,10 +165,12 @@ func (st *instanceStat) prune(now time.Time) {
 	}
 }
 
-// predict extrapolates the current sample using the average hourly rate of the
-// last seven days. Extrapolation only starts once the data is stale, and it is
-// capped at one day to avoid absurd values after a long outage.
-func (s *stateStore) predict(instanceID string, now time.Time, staleAfter time.Duration) prediction {
+// predict extrapolates the last known sample using the average hourly rate of
+// the last seven days. It runs on every poll so that traffic consumed inside
+// the current refresh interval is accounted for before the API reports it. The
+// extrapolation is capped at one day to avoid absurd values when an instance
+// has been idle for a long time.
+func (s *stateStore) predict(instanceID string, now time.Time) prediction {
 	var result prediction
 	if s == nil {
 		return result
@@ -188,14 +189,13 @@ func (s *stateStore) predict(instanceID string, now time.Time, staleAfter time.D
 			}
 		}
 	}
-	result.StaleFor = now.Sub(stat.LastChanged)
-	if result.StaleFor < 0 {
-		result.StaleFor = 0
+	result.Elapsed = now.Sub(stat.LastChanged)
+	if result.Elapsed < 0 {
+		result.Elapsed = 0
 	}
-	result.Stale = !stat.LastChanged.IsZero() && staleAfter > 0 && result.StaleFor >= staleAfter
 	result.Used = stat.LastUsed
-	if result.RatePerHour > 0 && result.Stale {
-		horizon := result.StaleFor
+	if result.RatePerHour > 0 {
+		horizon := result.Elapsed
 		if horizon > maxPredictHorizon {
 			horizon = maxPredictHorizon
 		}

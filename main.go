@@ -168,12 +168,11 @@ func (c *SDKClient) StartInstance(ctx context.Context, instanceID string) error 
 
 // evaluateOptions carries everything needed to judge one instance.
 type evaluateOptions struct {
-	Threshold  float64
-	Execute    bool
-	AutoStart  bool
-	Store      *stateStore
-	StaleAfter time.Duration
-	Now        time.Time
+	Threshold float64
+	Execute   bool
+	AutoStart bool
+	Store     *stateStore
+	Now       time.Time
 }
 
 func evaluate(ctx context.Context, api LighthouseAPI, instanceID string, opts evaluateOptions) error {
@@ -186,22 +185,23 @@ func evaluate(ctx context.Context, api LighthouseAPI, instanceID string, opts ev
 		now = time.Now()
 	}
 	percent := usage.Percent()
+	stopped := strings.EqualFold(usage.State, "SHUTDOWN") || strings.EqualFold(usage.State, "STOPPED")
 	log.Printf("instance=%s state=%s used=%d total=%d usage=%.2f%% threshold=%.2f%%", usage.InstanceID, usage.State, usage.UsedBytes, usage.TotalBytes, percent, opts.Threshold)
 	effective := percent
 	if opts.Store != nil {
 		opts.Store.observe(usage.InstanceID, usage.UsedBytes, usage.TotalBytes, now)
-		trend := opts.Store.predict(usage.InstanceID, now, opts.StaleAfter)
-		if trend.Points > 1 && trend.RatePerHour > 0 {
-			log.Printf("instance=%s history points=%d rate=%s/h trend=%.2f%%", usage.InstanceID, trend.Points, humanBytes(int64(trend.RatePerHour)), trend.Percent)
-		}
-		if trend.Stale {
-			log.Printf("instance=%s traffic data unchanged for %s, predicted=%s (%.2f%%)", usage.InstanceID, trend.StaleFor.Round(time.Minute), humanBytes(trend.Used), trend.Percent)
+		trend := opts.Store.predict(usage.InstanceID, now)
+		// A stopped instance consumes nothing, so extrapolating its history would
+		// keep growing forever and block --auto-start. Only running instances are
+		// projected inside the current refresh interval.
+		if !stopped && trend.Points > 1 && trend.RatePerHour > 0 {
+			log.Printf("instance=%s history points=%d rate=%s/h elapsed=%s predicted=%s (%.2f%%)", usage.InstanceID, trend.Points, humanBytes(int64(trend.RatePerHour)), trend.Elapsed.Round(time.Minute), humanBytes(trend.Used), trend.Percent)
 			if trend.Percent > effective {
 				effective = trend.Percent
 			}
 		}
 	}
-	if opts.AutoStart && effective < opts.Threshold && (strings.EqualFold(usage.State, "SHUTDOWN") || strings.EqualFold(usage.State, "STOPPED")) {
+	if opts.AutoStart && effective < opts.Threshold && stopped {
 		if !opts.Execute {
 			log.Printf("traffic appears reset; dry run, add --execute to start the instance")
 		} else if err := api.StartInstance(ctx, usage.InstanceID); err != nil {
@@ -213,7 +213,7 @@ func evaluate(ctx context.Context, api LighthouseAPI, instanceID string, opts ev
 	if effective < opts.Threshold {
 		return nil
 	}
-	if strings.EqualFold(usage.State, "SHUTDOWN") || strings.EqualFold(usage.State, "STOPPED") {
+	if stopped {
 		log.Printf("instance already stopped; no action taken")
 		return nil
 	}
@@ -246,9 +246,8 @@ func main() {
 	interval := flag.Duration("interval", 0, "repeat interval; 0 means run once")
 	execute := flag.Bool("execute", false, "actually stop the instance when threshold is exceeded")
 	autoStart := flag.Bool("auto-start", false, "start stopped instances when usage is below the threshold")
-	predict := flag.Bool("predict", envBool("PREDICT_ENABLED", true), "predict usage from history and stop when API data is stale")
+	predict := flag.Bool("predict", envBool("PREDICT_ENABLED", true), "predict usage between API refreshes and stop early when the predicted usage reaches the threshold")
 	statePath := flag.String("state-file", defaultStatePath(envFile), "traffic history file used for prediction")
-	staleAfter := flag.Duration("stale-after", envDuration("PREDICT_STALE_AFTER", 75*time.Minute), "treat traffic data as stale when it has not changed for this long")
 	flag.Parse()
 
 	targets, err := parseTargets(os.Getenv("TENCENTCLOUD_TARGETS"), *region, *instanceIDs)
@@ -260,9 +259,6 @@ func main() {
 	}
 	if *threshold <= 0 || *threshold > 100 {
 		log.Fatal("threshold must be greater than 0 and at most 100")
-	}
-	if *staleAfter <= 0 {
-		log.Fatal("stale-after must be greater than 0")
 	}
 	secretID := os.Getenv("TENCENTCLOUD_SECRET_ID")
 	secretKey := os.Getenv("TENCENTCLOUD_SECRET_KEY")
@@ -293,11 +289,10 @@ func main() {
 	for {
 		var failed bool
 		opts := evaluateOptions{
-			Threshold:  *threshold,
-			Execute:    *execute,
-			AutoStart:  *autoStart,
-			Store:      store,
-			StaleAfter: *staleAfter,
+			Threshold: *threshold,
+			Execute:   *execute,
+			AutoStart: *autoStart,
+			Store:     store,
 		}
 		for _, target := range targets {
 			client, err := lighthouse.NewClient(cred, target.Region, cpf)
@@ -505,18 +500,6 @@ func envBool(name string, fallback bool) bool {
 		return fallback
 	}
 	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return fallback
-	}
-	return parsed
-}
-
-func envDuration(name string, fallback time.Duration) time.Duration {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return fallback
-	}
-	parsed, err := time.ParseDuration(value)
 	if err != nil {
 		return fallback
 	}
