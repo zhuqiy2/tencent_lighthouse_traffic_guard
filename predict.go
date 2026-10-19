@@ -14,6 +14,10 @@ const (
 	maxSamplePoints   = 5000
 	maxPredictHorizon = 24 * time.Hour
 	statePruneAfter   = 45 * 24 * time.Hour
+
+	// historyWindow is how much past traffic data is kept. The average rate is
+	// computed over exactly this period.
+	historyWindow = 7 * 24 * time.Hour
 )
 
 const defaultStateFile = "lighthouse-traffic-state.json"
@@ -138,23 +142,34 @@ func (s *stateStore) observe(instanceID string, used, total int64, now time.Time
 	stat.TotalBytes = total
 	stat.LastUsed = used
 	stat.LastSeen = now
-	stat.prune()
+	stat.prune(now)
 	s.dirty = true
 }
 
-// prune caps the number of sample points. Points are kept regardless of age so
-// that a larger window configured later still has data; the window only filters
-// samples when computing the rate.
-func (st *instanceStat) prune() {
+// prune keeps the last seven days of samples. One point just older than the
+// cutoff is kept as the baseline so the average still spans the whole period.
+func (st *instanceStat) prune(now time.Time) {
+	cutoff := now.Add(-historyWindow)
+	if len(st.Points) > 1 {
+		index := sort.Search(len(st.Points), func(i int) bool {
+			return !st.Points[i].At.Before(cutoff)
+		})
+		if index >= len(st.Points) {
+			index = len(st.Points) - 1
+		}
+		if index > 1 {
+			st.Points = append(st.Points[:0], st.Points[index-1:]...)
+		}
+	}
 	if len(st.Points) > maxSamplePoints {
 		st.Points = append(st.Points[:0], st.Points[len(st.Points)-maxSamplePoints:]...)
 	}
 }
 
-// predict extrapolates the current sample using the average rate observed in
-// the history window. Extrapolation only starts once the data is stale, and it
-// is capped at one day to avoid absurd values after a long outage.
-func (s *stateStore) predict(instanceID string, now time.Time, window, staleAfter time.Duration) prediction {
+// predict extrapolates the current sample using the average hourly rate of the
+// last seven days. Extrapolation only starts once the data is stale, and it is
+// capped at one day to avoid absurd values after a long outage.
+func (s *stateStore) predict(instanceID string, now time.Time, staleAfter time.Duration) prediction {
 	var result prediction
 	if s == nil {
 		return result
@@ -165,20 +180,12 @@ func (s *stateStore) predict(instanceID string, now time.Time, window, staleAfte
 	}
 	result.Points = len(stat.Points)
 	points := stat.Points
-	if len(points) > 1 {
-		cutoff := now.Add(-window)
-		index := sort.Search(len(points), func(i int) bool {
-			return !points[i].At.Before(cutoff)
-		})
-		if index >= len(points) {
-			index = len(points) - 1
-		}
-		points = points[index:]
-	}
 	if len(points) >= 2 {
 		first, last := points[0], points[len(points)-1]
-		if elapsed := last.At.Sub(first.At); elapsed > 0 && last.Used >= first.Used {
-			result.RatePerHour = float64(last.Used-first.Used) / elapsed.Hours()
+		if last.Used >= first.Used {
+			if elapsed := last.At.Sub(first.At); elapsed > 0 {
+				result.RatePerHour = float64(last.Used-first.Used) / elapsed.Hours()
+			}
 		}
 	}
 	result.StaleFor = now.Sub(stat.LastChanged)

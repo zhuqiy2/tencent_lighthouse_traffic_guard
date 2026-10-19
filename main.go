@@ -172,7 +172,6 @@ type evaluateOptions struct {
 	Execute    bool
 	AutoStart  bool
 	Store      *stateStore
-	Window     time.Duration
 	StaleAfter time.Duration
 	Now        time.Time
 }
@@ -191,7 +190,7 @@ func evaluate(ctx context.Context, api LighthouseAPI, instanceID string, opts ev
 	effective := percent
 	if opts.Store != nil {
 		opts.Store.observe(usage.InstanceID, usage.UsedBytes, usage.TotalBytes, now)
-		trend := opts.Store.predict(usage.InstanceID, now, opts.Window, opts.StaleAfter)
+		trend := opts.Store.predict(usage.InstanceID, now, opts.StaleAfter)
 		if trend.Points > 1 && trend.RatePerHour > 0 {
 			log.Printf("instance=%s history points=%d rate=%s/h trend=%.2f%%", usage.InstanceID, trend.Points, humanBytes(int64(trend.RatePerHour)), trend.Percent)
 		}
@@ -249,7 +248,6 @@ func main() {
 	autoStart := flag.Bool("auto-start", false, "start stopped instances when usage is below the threshold")
 	predict := flag.Bool("predict", envBool("PREDICT_ENABLED", true), "predict usage from history and stop when API data is stale")
 	statePath := flag.String("state-file", defaultStatePath(envFile), "traffic history file used for prediction")
-	window := flag.Duration("window", envDuration("PREDICT_WINDOW", 7*24*time.Hour), "history window used to compute the usage rate")
 	staleAfter := flag.Duration("stale-after", envDuration("PREDICT_STALE_AFTER", 75*time.Minute), "treat traffic data as stale when it has not changed for this long")
 	flag.Parse()
 
@@ -262,9 +260,6 @@ func main() {
 	}
 	if *threshold <= 0 || *threshold > 100 {
 		log.Fatal("threshold must be greater than 0 and at most 100")
-	}
-	if *window <= 0 {
-		log.Fatal("window must be greater than 0")
 	}
 	if *staleAfter <= 0 {
 		log.Fatal("stale-after must be greater than 0")
@@ -302,7 +297,6 @@ func main() {
 			Execute:    *execute,
 			AutoStart:  *autoStart,
 			Store:      store,
-			Window:     *window,
 			StaleAfter: *staleAfter,
 		}
 		for _, target := range targets {

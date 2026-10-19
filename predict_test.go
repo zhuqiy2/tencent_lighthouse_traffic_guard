@@ -39,7 +39,7 @@ func TestPredictRateAndProjection(t *testing.T) {
 
 	now := start.Add(4 * time.Hour)
 	store.observe("lh-1", 200, 1000, now)
-	got := store.predict("lh-1", now, 7*24*time.Hour, 75*time.Minute)
+	got := store.predict("lh-1", now, 75*time.Minute)
 
 	if got.RatePerHour != 100 {
 		t.Fatalf("rate = %v, want 100", got.RatePerHour)
@@ -62,7 +62,7 @@ func TestPredictIsConservativeWhenFresh(t *testing.T) {
 	store.observe("lh-1", 100, 1000, start.Add(time.Hour))
 
 	now := start.Add(time.Hour)
-	got := store.predict("lh-1", now, 7*24*time.Hour, 75*time.Minute)
+	got := store.predict("lh-1", now, 75*time.Minute)
 	if got.Stale {
 		t.Fatal("fresh data must not be treated as stale")
 	}
@@ -71,20 +71,26 @@ func TestPredictIsConservativeWhenFresh(t *testing.T) {
 	}
 }
 
-func TestPredictUsesOnlyTheWindow(t *testing.T) {
+func TestPredictAveragesSevenDays(t *testing.T) {
 	store := newStateStore("")
 	start := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
-	// Old burst that should fall outside the three hour window.
-	store.observe("lh-1", 0, 1000, start)
-	store.observe("lh-1", 800, 1000, start.Add(time.Hour))
-	// Recent steady usage.
-	store.observe("lh-1", 900, 1000, start.Add(10*time.Hour))
-	store.observe("lh-1", 950, 1000, start.Add(11*time.Hour))
+	// Eight days of hourly samples, 10 bytes each hour.
+	const hours = 192
+	for hour := 0; hour <= hours; hour++ {
+		store.observe("lh-1", int64(hour*10), 10000, start.Add(time.Duration(hour)*time.Hour))
+	}
 
-	now := start.Add(11 * time.Hour)
-	got := store.predict("lh-1", now, 3*time.Hour, 75*time.Minute)
-	if got.RatePerHour != 50 {
-		t.Fatalf("rate = %v, want 50 from the window", got.RatePerHour)
+	now := start.Add(hours * time.Hour)
+	stat := store.instances["lh-1"]
+	if len(stat.Points) > 8*24+1 {
+		t.Fatalf("points = %d, history was not pruned", len(stat.Points))
+	}
+	if oldest := stat.Points[0]; oldest.At.Before(now.Add(-historyWindow - time.Hour)) {
+		t.Fatalf("oldest point = %v, history exceeds the retention period", oldest.At)
+	}
+	got := store.predict("lh-1", now, 75*time.Minute)
+	if got.RatePerHour != 10 {
+		t.Fatalf("rate = %v, want an average of 10 bytes per hour", got.RatePerHour)
 	}
 }
 
@@ -156,7 +162,6 @@ func TestEvaluateStopsOnStalePrediction(t *testing.T) {
 		Threshold:  30,
 		Execute:    true,
 		Store:      store,
-		Window:     7 * 24 * time.Hour,
 		StaleAfter: 75 * time.Minute,
 		Now:        now,
 	}
@@ -180,7 +185,6 @@ func TestEvaluateIgnoresPredictionWhenFresh(t *testing.T) {
 		Threshold:  30,
 		Execute:    true,
 		Store:      store,
-		Window:     7 * 24 * time.Hour,
 		StaleAfter: 75 * time.Minute,
 		Now:        now,
 	}
