@@ -41,6 +41,7 @@ export TENCENTCLOUD_INSTANCE_ID="lhins-xxxxxxxx,lhins-yyyyyyyy"
 CAM 用户的最小权限如下，策略模板见 [cam-policy-minimal.json](cam-policy-minimal.json)：
 
 - `lighthouse:DescribeInstances`
+- `lighthouse:DescribeRegions`
 - `lighthouse:DescribeInstancesTrafficPackages`
 - 实际执行关机时增加 `lighthouse:StopInstances`
 - 启用 `--auto-start` 时增加 `lighthouse:StartInstances`
@@ -98,6 +99,23 @@ TENCENTCLOUD_INSTANCE_ID=all
 ```
 
 `all` 不能与具体实例 ID 混用。自动发现模式的影响范围是整个地域，建议先不加 `--execute` 观察日志中的实例数量与流量数据。没有流量包的实例会被跳过，不会导致整次运行失败。
+
+### 自动覆盖全部地域
+
+用 `*` 作为地域，可自动枚举所有可用的 Lighthouse 地域，并在每个地域内自动发现实例：
+
+```dotenv
+TENCENTCLOUD_TARGETS=*=all
+```
+
+也可以写成：
+
+```dotenv
+TENCENTCLOUD_REGION=*
+TENCENTCLOUD_INSTANCE_ID=all
+```
+
+`*` 只能搭配 `all`。如果同时显式配置了某个地域，该地域不会被重复处理。全地域模式会产生较多 API 调用，请先用 dry-run 确认范围与耗时。
 
 确认行为后开启真实关机：
 

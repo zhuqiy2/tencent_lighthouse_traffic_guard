@@ -39,6 +39,10 @@ type LighthouseAPI interface {
 	StartInstance(ctx context.Context, instanceID string) error
 }
 
+type RegionLister interface {
+	ListRegions(ctx context.Context) ([]string, error)
+}
+
 type SDKClient struct {
 	client *lighthouse.Client
 }
@@ -47,6 +51,7 @@ type targetGroup struct {
 	Region       string
 	InstanceIDs  []string
 	AutoDiscover bool
+	AllRegions   bool
 }
 
 func (c *SDKClient) DescribeInstances(ctx context.Context, instanceID string) (Usage, error) {
@@ -120,6 +125,30 @@ func (c *SDKClient) ListInstanceIDs(ctx context.Context) ([]string, error) {
 		}
 	}
 	return ids, nil
+}
+
+func (c *SDKClient) ListRegions(ctx context.Context) ([]string, error) {
+	resp, err := c.client.DescribeRegionsWithContext(ctx, lighthouse.NewDescribeRegionsRequest())
+	if err != nil {
+		return nil, err
+	}
+	if resp.Response == nil {
+		return nil, fmt.Errorf("describe regions response is empty")
+	}
+	var regions []string
+	for _, region := range resp.Response.RegionSet {
+		if region == nil || region.Region == nil {
+			continue
+		}
+		if region.RegionState != nil && *region.RegionState != "AVAILABLE" {
+			continue
+		}
+		regions = append(regions, *region.Region)
+	}
+	if len(regions) == 0 {
+		return nil, fmt.Errorf("no available Lighthouse regions returned")
+	}
+	return regions, nil
 }
 
 func (c *SDKClient) StopInstance(ctx context.Context, instanceID string) error {
@@ -205,8 +234,14 @@ func main() {
 	cred := common.NewCredential(secretID, secretKey)
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Endpoint = "lighthouse.tencentcloudapi.com"
+
+	expandCtx, expandCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	targets, err = expandAllRegions(expandCtx, cred, cpf, *region, targets)
+	expandCancel()
+	if err != nil {
+		log.Fatal(err)
+	}
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var failed bool
 		for _, target := range targets {
 			client, err := lighthouse.NewClient(cred, target.Region, cpf)
@@ -215,11 +250,12 @@ func main() {
 				failed = true
 				continue
 			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			if runTarget(ctx, &SDKClient{client: client}, target, *threshold, *execute, *autoStart) {
 				failed = true
 			}
+			cancel()
 		}
-		cancel()
 		if failed {
 			os.Exit(1)
 		}
@@ -267,6 +303,12 @@ func buildTarget(region string, ids []string) (targetGroup, error) {
 	if len(ids) == 0 {
 		return targetGroup{}, fmt.Errorf("region %q has no instance IDs", region)
 	}
+	if region == "*" {
+		if !(len(ids) == 1 && strings.EqualFold(ids[0], "all")) {
+			return targetGroup{}, fmt.Errorf("\"*\" only supports all instances, use *=all")
+		}
+		return targetGroup{Region: "*", AutoDiscover: true, AllRegions: true}, nil
+	}
 	if len(ids) == 1 && strings.EqualFold(ids[0], "all") {
 		return targetGroup{Region: region, AutoDiscover: true}, nil
 	}
@@ -276,6 +318,46 @@ func buildTarget(region string, ids []string) (targetGroup, error) {
 		}
 	}
 	return targetGroup{Region: region, InstanceIDs: ids}, nil
+}
+
+func expandAllRegions(ctx context.Context, cred common.CredentialIface, cpf *profile.ClientProfile, bootstrapRegion string, targets []targetGroup) ([]targetGroup, error) {
+	var expanded []targetGroup
+	for _, target := range targets {
+		if !target.AllRegions {
+			expanded = append(expanded, target)
+			continue
+		}
+		if bootstrapRegion == "" || bootstrapRegion == "*" {
+			bootstrapRegion = "ap-guangzhou"
+		}
+		client, err := lighthouse.NewClient(cred, bootstrapRegion, cpf)
+		if err != nil {
+			return nil, fmt.Errorf("create region lister client: %w", err)
+		}
+		regions, err := (&SDKClient{client: client}).ListRegions(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list regions: %w", err)
+		}
+		expanded = mergeRegionTargets(expanded, regions)
+	}
+	return expanded, nil
+}
+
+func mergeRegionTargets(existing []targetGroup, regions []string) []targetGroup {
+	seen := make(map[string]struct{}, len(existing)+len(regions))
+	for _, target := range existing {
+		if !target.AllRegions {
+			seen[target.Region] = struct{}{}
+		}
+	}
+	for _, region := range regions {
+		if _, exists := seen[region]; exists {
+			continue
+		}
+		seen[region] = struct{}{}
+		existing = append(existing, targetGroup{Region: region, AutoDiscover: true})
+	}
+	return existing
 }
 
 func runTarget(ctx context.Context, api LighthouseAPI, target targetGroup, threshold float64, execute, autoStart bool) bool {

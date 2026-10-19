@@ -1,0 +1,18 @@
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "effect": "allow",
+      "action": [
+        "lighthouse:DescribeInstances",
+        "lighthouse:DescribeRegions",
+        "lighthouse:DescribeInstancesTrafficPackages",
+        "lighthouse:StopInstances",
+        "lighthouse:StartInstances"
+      ],
+      "resource": [
+        "*"
+      ]
+    }
+  ]
+}

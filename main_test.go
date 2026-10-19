@@ -71,6 +71,46 @@ func TestParseTargetsRejectsAllMixedWithIDs(t *testing.T) {
 	}
 }
 
+func TestParseTargetsAllRegions(t *testing.T) {
+	got, err := parseTargets("*=all", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []targetGroup{{Region: "*", AutoDiscover: true, AllRegions: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseTargets() = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseTargetsAllRegionsFromLegacyVariables(t *testing.T) {
+	got, err := parseTargets("", "*", "all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []targetGroup{{Region: "*", AutoDiscover: true, AllRegions: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseTargets() = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseTargetsRejectsAllRegionsWithExplicitIDs(t *testing.T) {
+	if _, err := parseTargets("*=lh-1", "", ""); err == nil {
+		t.Fatal("expected all-regions with explicit IDs to be rejected")
+	}
+}
+
+func TestMergeRegionTargetsKeepsExplicitAndDeduplicates(t *testing.T) {
+	existing := []targetGroup{{Region: "ap-seoul", InstanceIDs: []string{"lh-1"}}}
+	got := mergeRegionTargets(existing, []string{"ap-seoul", "ap-guangzhou"})
+	want := []targetGroup{
+		{Region: "ap-seoul", InstanceIDs: []string{"lh-1"}},
+		{Region: "ap-guangzhou", AutoDiscover: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mergeRegionTargets() = %#v, want %#v", got, want)
+	}
+}
+
 type fakeAPI struct {
 	usage      Usage
 	stop       bool
