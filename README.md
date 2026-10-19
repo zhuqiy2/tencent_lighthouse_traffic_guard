@@ -10,6 +10,7 @@
 - 已关机实例不会重复提交关机请求。
 - 支持多实例、多地域，以及按地域自动发现全部实例。
 - 可选 `--auto-start`：已关机且流量低于阈值时自动开机。
+- 本地记录每台实例的流量变化，按窗口（默认 7 天）计算平均速率；当 API 数据超过一个刷新周期未变化时，用预测用量判断是否关机。
 - 使用腾讯云官方 Go SDK。
 
 ## 编译
@@ -129,6 +130,45 @@ TENCENTCLOUD_INSTANCE_ID=all
 ```bash
 ./tencent-lighthouse-traffic-guard --execute
 ```
+
+## 流量预测
+
+腾讯云流量包用量大约每小时刷新一次，因此高频轮询往往会拿到同一个值。程序会把这些观测结果保存到本地历史文件，只记录用量真正发生变化的点，并用这些点计算平均增长速率：
+
+```text
+速率 = 窗口内最后一次用量 - 窗口内第一次用量
+       ----------------------------------------
+                    两次变化的时间间隔
+```
+
+达到以下条件时，程序会把预测用量作为判断依据：
+
+1. API 返回的用量已经连续 `PREDICT_STALE_AFTER`（默认 `75m`）没有变化；
+2. 窗口内至少有两个变化点，能算出速率；
+3. 预测用量 `当前用量 + 速率 × 未变化时长` 高于实际用量。
+
+预测结果会写进日志：
+
+```text
+instance=lhins-xxx history points=42 rate=312.50MB/h trend=91.20%
+instance=lhins-xxx traffic data unchanged for 2h0m0s, predicted=1000.00GB (95.80%)
+stop request submitted for instance=lhins-xxx
+```
+
+相关参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--predict` | `true` | 关闭后只使用 API 返回值判断 |
+| `--window` | `168h` | 计算平均速率的窗口，可设为 `720h` 观察一个月 |
+| `--stale-after` | `75m` | 用量多久未变化视为数据陈旧 |
+| `--state-file` | 与 env 文件同目录 | 历史文件路径 |
+
+对应环境变量为 `PREDICT_ENABLED`、`PREDICT_WINDOW`、`PREDICT_STALE_AFTER`、`STATE_FILE`。
+
+历史文件位于 env 文件所在目录（默认 `lighthouse-traffic-state.json`），以原子写入方式更新，已加入 `.gitignore`。预测只依赖本地历史，建议用同一个文件路径持续运行；多个进程同时写同一文件会互相覆盖。
+
+如果数据长期没有变化，预测时长最多外推 24 小时，避免长时间停机后产生严重偏大的估算。预测只是保守估计，不是腾讯云的官方计费数据。
 
 ## 常驻轮询
 

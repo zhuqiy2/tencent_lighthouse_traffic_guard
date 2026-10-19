@@ -172,7 +172,7 @@ func (f *fakeAPI) StartInstance(context.Context, string) error {
 
 func TestEvaluateDryRunDoesNotStop(t *testing.T) {
 	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 96, TotalBytes: 100, State: "RUNNING"}}
-	if err := evaluate(context.Background(), api, "lh-1", 95, false, false); err != nil {
+	if err := evaluate(context.Background(), api, "lh-1", evaluateOptions{Threshold: 95}); err != nil {
 		t.Fatal(err)
 	}
 	if api.stop {
@@ -182,7 +182,7 @@ func TestEvaluateDryRunDoesNotStop(t *testing.T) {
 
 func TestEvaluateStopsWhenEnabled(t *testing.T) {
 	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 95, TotalBytes: 100, State: "RUNNING"}}
-	if err := evaluate(context.Background(), api, "lh-1", 95, true, false); err != nil {
+	if err := evaluate(context.Background(), api, "lh-1", evaluateOptions{Threshold: 95, Execute: true}); err != nil {
 		t.Fatal(err)
 	}
 	if !api.stop {
@@ -192,7 +192,7 @@ func TestEvaluateStopsWhenEnabled(t *testing.T) {
 
 func TestEvaluateDoesNotStopBelowThreshold(t *testing.T) {
 	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 94, TotalBytes: 100, State: "RUNNING"}}
-	if err := evaluate(context.Background(), api, "lh-1", 95, true, false); err != nil {
+	if err := evaluate(context.Background(), api, "lh-1", evaluateOptions{Threshold: 95, Execute: true}); err != nil {
 		t.Fatal(err)
 	}
 	if api.stop {
@@ -202,7 +202,7 @@ func TestEvaluateDoesNotStopBelowThreshold(t *testing.T) {
 
 func TestEvaluateAutoStartsStoppedInstanceBelowThreshold(t *testing.T) {
 	api := &fakeAPI{usage: Usage{InstanceID: "lh-1", UsedBytes: 10, TotalBytes: 100, State: "STOPPED"}}
-	if err := evaluate(context.Background(), api, "lh-1", 95, true, true); err != nil {
+	if err := evaluate(context.Background(), api, "lh-1", evaluateOptions{Threshold: 95, Execute: true, AutoStart: true}); err != nil {
 		t.Fatal(err)
 	}
 	if !api.start {
@@ -213,7 +213,7 @@ func TestEvaluateAutoStartsStoppedInstanceBelowThreshold(t *testing.T) {
 func TestRunTargetSkipsInstancesWithoutTrafficPackage(t *testing.T) {
 	api := &fakeAPI{noTraffic: true, discovered: []string{"lh-1", "lh-2"}}
 	target := targetGroup{Region: "ap-seoul", AutoDiscover: true}
-	if failed := runTarget(context.Background(), api, target, 95, true, false); failed {
+	if failed := runTarget(context.Background(), api, target, evaluateOptions{Threshold: 95, Execute: true}); failed {
 		t.Fatal("instances without traffic packages should not mark the run as failed")
 	}
 	if api.stop || api.start {
@@ -224,7 +224,7 @@ func TestRunTargetSkipsInstancesWithoutTrafficPackage(t *testing.T) {
 func TestRunTargetExplicitInstanceWithoutTrafficPackageFails(t *testing.T) {
 	api := &fakeAPI{noTraffic: true}
 	target := targetGroup{Region: "ap-seoul", InstanceIDs: []string{"lh-1"}}
-	if failed := runTarget(context.Background(), api, target, 95, true, false); !failed {
+	if failed := runTarget(context.Background(), api, target, evaluateOptions{Threshold: 95, Execute: true}); !failed {
 		t.Fatal("explicit instance without traffic package should be reported as failure")
 	}
 }

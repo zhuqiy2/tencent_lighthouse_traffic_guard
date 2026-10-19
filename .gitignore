@@ -2,3 +2,5 @@
 .env.local
 *.exe
 dist/
+lighthouse-traffic-state.json
+lighthouse-traffic-state.json.tmp

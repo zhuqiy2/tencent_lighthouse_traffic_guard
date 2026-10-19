@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -165,15 +166,44 @@ func (c *SDKClient) StartInstance(ctx context.Context, instanceID string) error 
 	return err
 }
 
-func evaluate(ctx context.Context, api LighthouseAPI, instanceID string, threshold float64, execute, autoStart bool) error {
+// evaluateOptions carries everything needed to judge one instance.
+type evaluateOptions struct {
+	Threshold  float64
+	Execute    bool
+	AutoStart  bool
+	Store      *stateStore
+	Window     time.Duration
+	StaleAfter time.Duration
+	Now        time.Time
+}
+
+func evaluate(ctx context.Context, api LighthouseAPI, instanceID string, opts evaluateOptions) error {
 	usage, err := api.DescribeInstances(ctx, instanceID)
 	if err != nil {
 		return fmt.Errorf("query traffic usage: %w", err)
 	}
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
 	percent := usage.Percent()
-	log.Printf("instance=%s state=%s used=%d total=%d usage=%.2f%% threshold=%.2f%%", usage.InstanceID, usage.State, usage.UsedBytes, usage.TotalBytes, percent, threshold)
-	if autoStart && percent < threshold && (strings.EqualFold(usage.State, "SHUTDOWN") || strings.EqualFold(usage.State, "STOPPED")) {
-		if !execute {
+	log.Printf("instance=%s state=%s used=%d total=%d usage=%.2f%% threshold=%.2f%%", usage.InstanceID, usage.State, usage.UsedBytes, usage.TotalBytes, percent, opts.Threshold)
+	effective := percent
+	if opts.Store != nil {
+		opts.Store.observe(usage.InstanceID, usage.UsedBytes, usage.TotalBytes, now)
+		trend := opts.Store.predict(usage.InstanceID, now, opts.Window, opts.StaleAfter)
+		if trend.Points > 1 && trend.RatePerHour > 0 {
+			log.Printf("instance=%s history points=%d rate=%s/h trend=%.2f%%", usage.InstanceID, trend.Points, humanBytes(int64(trend.RatePerHour)), trend.Percent)
+		}
+		if trend.Stale {
+			log.Printf("instance=%s traffic data unchanged for %s, predicted=%s (%.2f%%)", usage.InstanceID, trend.StaleFor.Round(time.Minute), humanBytes(trend.Used), trend.Percent)
+			if trend.Percent > effective {
+				effective = trend.Percent
+			}
+		}
+	}
+	if opts.AutoStart && effective < opts.Threshold && (strings.EqualFold(usage.State, "SHUTDOWN") || strings.EqualFold(usage.State, "STOPPED")) {
+		if !opts.Execute {
 			log.Printf("traffic appears reset; dry run, add --execute to start the instance")
 		} else if err := api.StartInstance(ctx, usage.InstanceID); err != nil {
 			return fmt.Errorf("start instance: %w", err)
@@ -181,15 +211,19 @@ func evaluate(ctx context.Context, api LighthouseAPI, instanceID string, thresho
 			log.Printf("start request submitted for instance=%s", usage.InstanceID)
 		}
 	}
-	if percent < threshold {
+	if effective < opts.Threshold {
 		return nil
 	}
 	if strings.EqualFold(usage.State, "SHUTDOWN") || strings.EqualFold(usage.State, "STOPPED") {
 		log.Printf("instance already stopped; no action taken")
 		return nil
 	}
-	if !execute {
-		log.Printf("threshold exceeded; dry run, add --execute to stop the instance")
+	if !opts.Execute {
+		if effective > percent {
+			log.Printf("predicted usage exceeded threshold; dry run, add --execute to stop the instance")
+		} else {
+			log.Printf("threshold exceeded; dry run, add --execute to stop the instance")
+		}
 		return nil
 	}
 	if err := api.StopInstance(ctx, usage.InstanceID); err != nil {
@@ -213,6 +247,10 @@ func main() {
 	interval := flag.Duration("interval", 0, "repeat interval; 0 means run once")
 	execute := flag.Bool("execute", false, "actually stop the instance when threshold is exceeded")
 	autoStart := flag.Bool("auto-start", false, "start stopped instances when usage is below the threshold")
+	predict := flag.Bool("predict", envBool("PREDICT_ENABLED", true), "predict usage from history and stop when API data is stale")
+	statePath := flag.String("state-file", defaultStatePath(envFile), "traffic history file used for prediction")
+	window := flag.Duration("window", envDuration("PREDICT_WINDOW", 7*24*time.Hour), "history window used to compute the usage rate")
+	staleAfter := flag.Duration("stale-after", envDuration("PREDICT_STALE_AFTER", 75*time.Minute), "treat traffic data as stale when it has not changed for this long")
 	flag.Parse()
 
 	targets, err := parseTargets(os.Getenv("TENCENTCLOUD_TARGETS"), *region, *instanceIDs)
@@ -225,10 +263,26 @@ func main() {
 	if *threshold <= 0 || *threshold > 100 {
 		log.Fatal("threshold must be greater than 0 and at most 100")
 	}
+	if *window <= 0 {
+		log.Fatal("window must be greater than 0")
+	}
+	if *staleAfter <= 0 {
+		log.Fatal("stale-after must be greater than 0")
+	}
 	secretID := os.Getenv("TENCENTCLOUD_SECRET_ID")
 	secretKey := os.Getenv("TENCENTCLOUD_SECRET_KEY")
 	if secretID == "" || secretKey == "" {
 		log.Fatal("set TENCENTCLOUD_SECRET_ID and TENCENTCLOUD_SECRET_KEY")
+	}
+
+	var store *stateStore
+	if *predict {
+		var err error
+		store, err = loadState(*statePath)
+		if err != nil {
+			log.Printf("state file %s unusable, starting a new history: %v", *statePath, err)
+			store = newStateStore(*statePath)
+		}
 	}
 
 	cred := common.NewCredential(secretID, secretKey)
@@ -243,6 +297,14 @@ func main() {
 	}
 	for {
 		var failed bool
+		opts := evaluateOptions{
+			Threshold:  *threshold,
+			Execute:    *execute,
+			AutoStart:  *autoStart,
+			Store:      store,
+			Window:     *window,
+			StaleAfter: *staleAfter,
+		}
 		for _, target := range targets {
 			client, err := lighthouse.NewClient(cred, target.Region, cpf)
 			if err != nil {
@@ -251,10 +313,16 @@ func main() {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			if runTarget(ctx, &SDKClient{client: client}, target, *threshold, *execute, *autoStart) {
+			if runTarget(ctx, &SDKClient{client: client}, target, opts) {
 				failed = true
 			}
 			cancel()
+		}
+		if store != nil {
+			store.pruneInstances(time.Now())
+			if err := store.save(); err != nil {
+				log.Printf("save traffic history: %v", err)
+			}
 		}
 		if failed {
 			os.Exit(1)
@@ -366,7 +434,7 @@ func mergeRegionTargets(existing []targetGroup, regions []string) []targetGroup 
 	return existing
 }
 
-func runTarget(ctx context.Context, api LighthouseAPI, target targetGroup, threshold float64, execute, autoStart bool) bool {
+func runTarget(ctx context.Context, api LighthouseAPI, target targetGroup, opts evaluateOptions) bool {
 	ids := target.InstanceIDs
 	if target.AutoDiscover {
 		discovered, err := api.ListInstanceIDs(ctx)
@@ -379,7 +447,7 @@ func runTarget(ctx context.Context, api LighthouseAPI, target targetGroup, thres
 	}
 	failed := false
 	for _, instanceID := range ids {
-		err := evaluate(ctx, api, instanceID, threshold, execute, autoStart)
+		err := evaluate(ctx, api, instanceID, opts)
 		if err == nil {
 			continue
 		}
@@ -435,6 +503,43 @@ func envFloat(name string, fallback float64) float64 {
 		return fallback
 	}
 	return value
+}
+
+func envBool(name string, fallback bool) bool {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envDuration(name string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+// defaultStatePath keeps the history next to the env file so cron runs from a
+// different working directory still reuse the same file.
+func defaultStatePath(envFile string) string {
+	if envFile == "" {
+		return defaultStateFile
+	}
+	dir := filepath.Dir(envFile)
+	if dir == "" || dir == "." {
+		return defaultStateFile
+	}
+	return filepath.Join(dir, defaultStateFile)
 }
 
 func loadEnvFile(path string) error {
