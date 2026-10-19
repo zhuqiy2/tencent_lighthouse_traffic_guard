@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -22,9 +23,7 @@ type Usage struct {
 	State      string
 }
 
-type usageState struct {
-	UsedBytes int64 `json:"usedBytes"`
-}
+var errNoTrafficPackage = errors.New("no traffic package")
 
 func (u Usage) Percent() float64 {
 	if u.TotalBytes <= 0 {
@@ -35,6 +34,7 @@ func (u Usage) Percent() float64 {
 
 type LighthouseAPI interface {
 	DescribeInstances(ctx context.Context, instanceID string) (Usage, error)
+	ListInstanceIDs(ctx context.Context) ([]string, error)
 	StopInstance(ctx context.Context, instanceID string) error
 	StartInstance(ctx context.Context, instanceID string) error
 }
@@ -44,8 +44,9 @@ type SDKClient struct {
 }
 
 type targetGroup struct {
-	Region      string
-	InstanceIDs []string
+	Region       string
+	InstanceIDs  []string
+	AutoDiscover bool
 }
 
 func (c *SDKClient) DescribeInstances(ctx context.Context, instanceID string) (Usage, error) {
@@ -75,7 +76,7 @@ func (c *SDKClient) DescribeInstances(ctx context.Context, instanceID string) (U
 		return Usage{}, err
 	}
 	if trafficResp.Response == nil || len(trafficResp.Response.InstanceTrafficPackageSet) != 1 || len(trafficResp.Response.InstanceTrafficPackageSet[0].TrafficPackageSet) == 0 {
-		return Usage{}, fmt.Errorf("no traffic package found for instance %s", *instance.InstanceId)
+		return Usage{}, fmt.Errorf("%w for instance %s", errNoTrafficPackage, *instance.InstanceId)
 	}
 	traffic := trafficResp.Response.InstanceTrafficPackageSet[0].TrafficPackageSet[0]
 	if traffic == nil || traffic.TrafficUsed == nil || traffic.TrafficPackageTotal == nil {
@@ -87,6 +88,38 @@ func (c *SDKClient) DescribeInstances(ctx context.Context, instanceID string) (U
 		TotalBytes: *traffic.TrafficPackageTotal,
 		State:      valueOrEmpty(instance.InstanceState),
 	}, nil
+}
+
+func (c *SDKClient) ListInstanceIDs(ctx context.Context) ([]string, error) {
+	const pageSize int64 = 100
+	var ids []string
+	for offset := int64(0); ; offset += pageSize {
+		offsetValue := offset
+		limitValue := pageSize
+		req := lighthouse.NewDescribeInstancesRequest()
+		req.Offset = &offsetValue
+		req.Limit = &limitValue
+		resp, err := c.client.DescribeInstancesWithContext(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Response == nil {
+			return nil, fmt.Errorf("describe instances response is empty")
+		}
+		for _, instance := range resp.Response.InstanceSet {
+			if instance != nil && instance.InstanceId != nil {
+				ids = append(ids, *instance.InstanceId)
+			}
+		}
+		total := int64(0)
+		if resp.Response.TotalCount != nil {
+			total = *resp.Response.TotalCount
+		}
+		if int64(len(resp.Response.InstanceSet)) < pageSize || int64(len(ids)) >= total {
+			break
+		}
+	}
+	return ids, nil
 }
 
 func (c *SDKClient) StopInstance(ctx context.Context, instanceID string) error {
@@ -182,12 +215,8 @@ func main() {
 				failed = true
 				continue
 			}
-			api := &SDKClient{client: client}
-			for _, instanceID := range target.InstanceIDs {
-				if err := evaluate(ctx, api, instanceID, *threshold, *execute, *autoStart); err != nil {
-					log.Print(err)
-					failed = true
-				}
+			if runTarget(ctx, &SDKClient{client: client}, target, *threshold, *execute, *autoStart) {
+				failed = true
 			}
 		}
 		cancel()
@@ -207,7 +236,11 @@ func parseTargets(value, fallbackRegion, fallbackIDs string) ([]targetGroup, err
 		if len(ids) == 0 {
 			return nil, nil
 		}
-		return []targetGroup{{Region: fallbackRegion, InstanceIDs: ids}}, nil
+		target, err := buildTarget(fallbackRegion, ids)
+		if err != nil {
+			return nil, err
+		}
+		return []targetGroup{target}, nil
 	}
 	var targets []targetGroup
 	seenRegions := make(map[string]struct{})
@@ -215,19 +248,61 @@ func parseTargets(value, fallbackRegion, fallbackIDs string) ([]targetGroup, err
 		region, idsValue, found := strings.Cut(item, "=")
 		region = strings.TrimSpace(region)
 		if !found || region == "" {
-			return nil, fmt.Errorf("invalid target %q, expected region=instance-id[,instance-id]", item)
+			return nil, fmt.Errorf("invalid target %q, expected region=instance-id[,instance-id] or region=all", item)
 		}
 		if _, exists := seenRegions[region]; exists {
 			return nil, fmt.Errorf("duplicate region %q in TENCENTCLOUD_TARGETS", region)
 		}
-		ids := splitInstanceIDs(idsValue)
-		if len(ids) == 0 {
-			return nil, fmt.Errorf("region %q has no instance IDs", region)
+		target, err := buildTarget(region, splitInstanceIDs(idsValue))
+		if err != nil {
+			return nil, err
 		}
 		seenRegions[region] = struct{}{}
-		targets = append(targets, targetGroup{Region: region, InstanceIDs: ids})
+		targets = append(targets, target)
 	}
 	return targets, nil
+}
+
+func buildTarget(region string, ids []string) (targetGroup, error) {
+	if len(ids) == 0 {
+		return targetGroup{}, fmt.Errorf("region %q has no instance IDs", region)
+	}
+	if len(ids) == 1 && strings.EqualFold(ids[0], "all") {
+		return targetGroup{Region: region, AutoDiscover: true}, nil
+	}
+	for _, id := range ids {
+		if strings.EqualFold(id, "all") {
+			return targetGroup{}, fmt.Errorf("region %q: \"all\" cannot be combined with explicit instance IDs", region)
+		}
+	}
+	return targetGroup{Region: region, InstanceIDs: ids}, nil
+}
+
+func runTarget(ctx context.Context, api LighthouseAPI, target targetGroup, threshold float64, execute, autoStart bool) bool {
+	ids := target.InstanceIDs
+	if target.AutoDiscover {
+		discovered, err := api.ListInstanceIDs(ctx)
+		if err != nil {
+			log.Printf("region=%s discover instances: %v", target.Region, err)
+			return true
+		}
+		ids = discovered
+		log.Printf("region=%s discovered=%d instances", target.Region, len(ids))
+	}
+	failed := false
+	for _, instanceID := range ids {
+		err := evaluate(ctx, api, instanceID, threshold, execute, autoStart)
+		if err == nil {
+			continue
+		}
+		if target.AutoDiscover && errors.Is(err, errNoTrafficPackage) {
+			log.Printf("instance=%s skipped: no traffic package", instanceID)
+			continue
+		}
+		log.Print(err)
+		failed = true
+	}
+	return failed
 }
 
 func splitInstanceIDs(value string) []string {

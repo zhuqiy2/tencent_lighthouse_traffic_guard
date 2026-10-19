@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -39,14 +40,54 @@ func TestParseTargetsFallsBackToLegacyVariables(t *testing.T) {
 	}
 }
 
-type fakeAPI struct {
-	usage Usage
-	stop  bool
-	start bool
+func TestParseTargetsAll(t *testing.T) {
+	got, err := parseTargets("ap-seoul=all;ap-guangzhou=lh-gz-1", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []targetGroup{
+		{Region: "ap-seoul", AutoDiscover: true},
+		{Region: "ap-guangzhou", InstanceIDs: []string{"lh-gz-1"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseTargets() = %#v, want %#v", got, want)
+	}
 }
 
-func (f *fakeAPI) DescribeInstances(context.Context, string) (Usage, error) {
+func TestParseTargetsAllFromLegacyVariable(t *testing.T) {
+	got, err := parseTargets("", "ap-seoul", "ALL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []targetGroup{{Region: "ap-seoul", AutoDiscover: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseTargets() = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseTargetsRejectsAllMixedWithIDs(t *testing.T) {
+	if _, err := parseTargets("ap-seoul=all,lh-1", "", ""); err == nil {
+		t.Fatal("expected mixed all and explicit IDs to be rejected")
+	}
+}
+
+type fakeAPI struct {
+	usage      Usage
+	stop       bool
+	start      bool
+	discovered []string
+	noTraffic  bool
+}
+
+func (f *fakeAPI) DescribeInstances(_ context.Context, instanceID string) (Usage, error) {
+	if f.noTraffic {
+		return Usage{}, fmt.Errorf("%w for instance %s", errNoTrafficPackage, instanceID)
+	}
 	return f.usage, nil
+}
+
+func (f *fakeAPI) ListInstanceIDs(context.Context) ([]string, error) {
+	return f.discovered, nil
 }
 
 func (f *fakeAPI) StopInstance(context.Context, string) error {
@@ -96,5 +137,24 @@ func TestEvaluateAutoStartsStoppedInstanceBelowThreshold(t *testing.T) {
 	}
 	if !api.start {
 		t.Fatal("stopped instance was not started")
+	}
+}
+
+func TestRunTargetSkipsInstancesWithoutTrafficPackage(t *testing.T) {
+	api := &fakeAPI{noTraffic: true, discovered: []string{"lh-1", "lh-2"}}
+	target := targetGroup{Region: "ap-seoul", AutoDiscover: true}
+	if failed := runTarget(context.Background(), api, target, 95, true, false); failed {
+		t.Fatal("instances without traffic packages should not mark the run as failed")
+	}
+	if api.stop || api.start {
+		t.Fatal("instances without traffic packages must not change state")
+	}
+}
+
+func TestRunTargetExplicitInstanceWithoutTrafficPackageFails(t *testing.T) {
+	api := &fakeAPI{noTraffic: true}
+	target := targetGroup{Region: "ap-seoul", InstanceIDs: []string{"lh-1"}}
+	if failed := runTarget(context.Background(), api, target, 95, true, false); !failed {
+		t.Fatal("explicit instance without traffic package should be reported as failure")
 	}
 }

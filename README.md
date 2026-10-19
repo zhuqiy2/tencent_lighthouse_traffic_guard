@@ -8,6 +8,8 @@
 - 默认阈值为 95%，达到阈值即触发判断。
 - 默认 dry-run，不会关机；只有增加 `--execute` 才会调用 `StopInstances`。
 - 已关机实例不会重复提交关机请求。
+- 支持多实例、多地域，以及按地域自动发现全部实例。
+- 可选 `--auto-start`：已关机且流量低于阈值时自动开机。
 - 使用腾讯云官方 Go SDK。
 
 ## 编译
@@ -41,6 +43,7 @@ CAM 用户的最小权限如下，策略模板见 [cam-policy-minimal.json](cam-
 - `lighthouse:DescribeInstances`
 - `lighthouse:DescribeInstancesTrafficPackages`
 - 实际执行关机时增加 `lighthouse:StopInstances`
+- 启用 `--auto-start` 时增加 `lighthouse:StartInstances`
 
 建议先只授予前两个权限进行观察，确认日志和阈值无误后，再把 `lighthouse:StopInstances` 加到同一策略。
 
@@ -79,6 +82,23 @@ TENCENTCLOUD_TARGETS=ap-seoul=lhins-seoul-1,lhins-seoul-2;ap-guangzhou=lhins-gz-
 
 设置 `TENCENTCLOUD_TARGETS` 后，它会优先于 `TENCENTCLOUD_REGION` 和 `TENCENTCLOUD_INSTANCE_ID`。每个地域使用独立 API 客户端。
 
+### 自动发现地域内所有实例
+
+把实例 ID 写成 `all`，程序会分页列出该地域的全部实例，并只处理存在有效流量包的实例：
+
+```dotenv
+TENCENTCLOUD_TARGETS=ap-seoul=all;ap-guangzhou=all
+```
+
+单地域也可以直接写：
+
+```dotenv
+TENCENTCLOUD_REGION=ap-seoul
+TENCENTCLOUD_INSTANCE_ID=all
+```
+
+`all` 不能与具体实例 ID 混用。自动发现模式的影响范围是整个地域，建议先不加 `--execute` 观察日志中的实例数量与流量数据。没有流量包的实例会被跳过，不会导致整次运行失败。
+
 确认行为后开启真实关机：
 
 ```bash
@@ -106,6 +126,8 @@ TENCENTCLOUD_TARGETS=ap-seoul=lhins-seoul-1,lhins-seoul-2;ap-guangzhou=lhins-gz-
 ## 注意事项
 
 - 本程序只处理查询结果中的第一个流量包；部署前应确认目标实例只有一个当前有效套餐。
+- 自动发现模式（`all`）会覆盖地域内全部实例，请先用 dry-run 确认范围。
 - 关机请求是异步提交的，程序记录“request submitted”不代表实例已经完成关机。
-- 达到阈值后，程序不会自动开机，也不会自动购买或续费流量包。
+- 启用 `--auto-start` 时，已关机且流量低于阈值的实例会被自动启动。
+- 程序不会自动购买或续费流量包。
 - 请在测试实例上先验证区域、实例 ID、权限和流量统计结果。
